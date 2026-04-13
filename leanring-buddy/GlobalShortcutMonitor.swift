@@ -1,10 +1,10 @@
 //
-//  GlobalPushToTalkShortcutMonitor.swift
+//  GlobalShortcutMonitor.swift
 //  leanring-buddy
 //
-//  Captures push-to-talk keyboard shortcuts while makesomething is running in the
-//  background. Uses a listen-only CGEvent tap so modifier-only shortcuts like
-//  ctrl + option behave more like a real system-wide voice tool.
+//  Captures global keyboard shortcuts (Cmd+K, Escape) and mouse clicks
+//  while the app is running in the background. Uses a listen-only CGEvent
+//  tap so shortcuts work system-wide without intercepting user input.
 //
 
 import AppKit
@@ -12,16 +12,28 @@ import Combine
 import CoreGraphics
 import Foundation
 
-final class GlobalPushToTalkShortcutMonitor: ObservableObject {
-    let shortcutTransitionPublisher = PassthroughSubject<BuddyPushToTalkShortcut.ShortcutTransition, Never>()
+final class GlobalShortcutMonitor: ObservableObject {
+    /// Fires when the user presses Cmd+K anywhere in the system.
+    let cmdKPressedPublisher = PassthroughSubject<Void, Never>()
+
+    /// Fires when the user presses Escape anywhere in the system.
+    let escapePressedPublisher = PassthroughSubject<Void, Never>()
+
+    /// Fires when the user clicks the left mouse button. Only publishes
+    /// when `isClickMonitoringEnabled` is true (during awaitingUserClick).
+    /// The CGPoint is in CoreGraphics coordinates (top-left origin).
+    let mouseClickedPublisher = PassthroughSubject<CGPoint, Never>()
+
+    /// Set to true during awaitingUserClick state to start publishing
+    /// mouse click events. Set to false at all other times.
+    var isClickMonitoringEnabled = false
 
     private var globalEventTap: CFMachPort?
     private var globalEventTapRunLoopSource: CFRunLoopSource?
-    /// Mutated exclusively from the CGEvent tap callback, which runs on
-    /// `CFRunLoopGetMain()` and therefore always executes on the main thread.
-    /// Published so the overlay can hide immediately on key release without
-    /// waiting for the async dictation state pipeline to catch up.
-    @Published private(set) var isShortcutCurrentlyPressed = false
+
+    /// Key code constants
+    private static let keyCodeK: UInt16 = 40
+    private static let keyCodeEscape: UInt16 = 53
 
     deinit {
         stop()
@@ -29,12 +41,9 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
 
     func start() {
         // If the event tap is already running, don't restart it.
-        // Restarting resets isShortcutCurrentlyPressed, which would kill
-        // the waveform overlay mid-press when the permission poller calls
-        // refreshAllPermissions → start() every few seconds.
         guard globalEventTap == nil else { return }
 
-        let monitoredEventTypes: [CGEventType] = [.flagsChanged, .keyDown, .keyUp]
+        let monitoredEventTypes: [CGEventType] = [.keyDown, .leftMouseUp]
         let eventMask = monitoredEventTypes.reduce(CGEventMask(0)) { currentMask, eventType in
             currentMask | (CGEventMask(1) << eventType.rawValue)
         }
@@ -44,14 +53,11 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
                 return Unmanaged.passUnretained(event)
             }
 
-            let globalPushToTalkShortcutMonitor = Unmanaged<GlobalPushToTalkShortcutMonitor>
+            let monitor = Unmanaged<GlobalShortcutMonitor>
                 .fromOpaque(userInfo)
                 .takeUnretainedValue()
 
-            return globalPushToTalkShortcutMonitor.handleGlobalEventTap(
-                eventType: eventType,
-                event: event
-            )
+            return monitor.handleGlobalEventTap(eventType: eventType, event: event)
         }
 
         guard let globalEventTap = CGEvent.tapCreate(
@@ -62,7 +68,7 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             callback: eventTapCallback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
-            print("⚠️ Global push-to-talk: couldn't create CGEvent tap")
+            print("⚠️ GlobalShortcutMonitor: couldn't create CGEvent tap")
             return
         }
 
@@ -72,7 +78,7 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             0
         ) else {
             CFMachPortInvalidate(globalEventTap)
-            print("⚠️ Global push-to-talk: couldn't create event tap run loop source")
+            print("⚠️ GlobalShortcutMonitor: couldn't create event tap run loop source")
             return
         }
 
@@ -84,8 +90,6 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     }
 
     func stop() {
-        isShortcutCurrentlyPressed = false
-
         if let globalEventTapRunLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), globalEventTapRunLoopSource, .commonModes)
             self.globalEventTapRunLoopSource = nil
@@ -101,6 +105,7 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
         eventType: CGEventType,
         event: CGEvent
     ) -> Unmanaged<CGEvent>? {
+        // Re-enable the tap if macOS disabled it due to timeout
         if eventType == .tapDisabledByTimeout || eventType == .tapDisabledByUserInput {
             if let globalEventTap {
                 CGEvent.tapEnable(tap: globalEventTap, enable: true)
@@ -108,23 +113,24 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             return Unmanaged.passUnretained(event)
         }
 
-        let eventKeyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
-        let shortcutTransition = BuddyPushToTalkShortcut.shortcutTransition(
-            for: eventType,
-            keyCode: eventKeyCode,
-            modifierFlagsRawValue: event.flags.rawValue,
-            wasShortcutPreviouslyPressed: isShortcutCurrentlyPressed
-        )
+        if eventType == .keyDown {
+            let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+            let flags = event.flags
 
-        switch shortcutTransition {
-        case .none:
-            break
-        case .pressed:
-            isShortcutCurrentlyPressed = true
-            shortcutTransitionPublisher.send(.pressed)
-        case .released:
-            isShortcutCurrentlyPressed = false
-            shortcutTransitionPublisher.send(.released)
+            // Cmd+K: trigger the navigation prompt
+            if keyCode == Self.keyCodeK && flags.contains(.maskCommand) {
+                cmdKPressedPublisher.send()
+            }
+
+            // Escape: cancel navigation
+            if keyCode == Self.keyCodeEscape {
+                escapePressedPublisher.send()
+            }
+        }
+
+        if eventType == .leftMouseUp && isClickMonitoringEnabled {
+            let clickLocation = event.location
+            mouseClickedPublisher.send(clickLocation)
         }
 
         return Unmanaged.passUnretained(event)
