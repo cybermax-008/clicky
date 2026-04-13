@@ -1,5 +1,7 @@
 # Clicky-Web SDK
 
+> Forked from [farzaa/clicky](https://github.com/farzaa/clicky) — an AI buddy that lives on your Mac. This fork transforms it into an embeddable web SDK for step-by-step UI navigation.
+
 An embeddable JavaScript SDK that adds step-by-step UI navigation guidance to any web app. Users press **Cmd+K** (or **Ctrl+K**), type what they want to do, and a blue cursor guides them through the interface — pointing at each element to click, waiting for them to click it, then showing the next step.
 
 Powered by Claude's vision API. The SDK captures a screenshot of the page, sends it to Claude, and Claude responds with exactly where the user should click next.
